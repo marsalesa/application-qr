@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="id"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scanner Gerbang</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:#10171c;color:#fff;min-height:100vh;display:flex;flex-direction:column}
+#layar{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:24px;transition:background .15s}
+#layar.idle{background:#10171c}#layar.masuk{background:#0b8a5f}#layar.keluar{background:#d9480f}#layar.dup{background:#556}#layar.bad{background:#c92a2a;animation:k .4s 4}
+@keyframes k{50%{filter:brightness(1.7)}}
+#foto{width:150px;height:200px;object-fit:cover;border-radius:12px;border:4px solid #fff;margin-bottom:16px;display:none;background:#0003}
+#st{font-size:clamp(2rem,8vw,4.5rem);font-weight:800;margin:0}#nm{font-size:clamp(1.3rem,4vw,2.5rem);margin:8px 0 0}#ket{font-size:1.2rem;margin-top:8px;opacity:.9}
+#jam{position:absolute;top:12px;right:16px;font-size:1.6rem;font-variant-numeric:tabular-nums}#sts{position:absolute;top:14px;left:16px;font-weight:700}
+#in{position:absolute;opacity:0;pointer-events:none}
+.bar{background:#18222a;padding:10px 16px;display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+button{padding:10px 14px;border:0;border-radius:8px;background:#2fbf8f;font-weight:700;cursor:pointer}
+#reader{width:260px}#rw{flex:1;min-width:200px;font-size:.85rem;max-height:120px;overflow:auto;margin:0;padding-left:16px}
+</style></head><body>
+<div id="sts"></div><div id="jam"></div>
+<div id="layar" class="idle"><img id="foto" alt=""><h1 id="st">SIAP — TAP KARTU</h1><p id="nm"></p><p id="ket"></p></div>
+<input id="in" autocomplete="off" aria-label="input scanner">
+<div class="bar"><button id="kam">Aktifkan kamera</button><button id="pin" style="background:#e9eef1">Ganti PIN</button><div id="reader"></div><ul id="rw"></ul></div>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="config.js"></script>
+<script>
+if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+const sb=supabase.createClient(CFG.URL,CFG.KEY),$=i=>document.getElementById(i),W='Asia/Jakarta';
+const jam=t=>new Date(t).toLocaleTimeString('id-ID',{timeZone:W,hour12:false});
+setInterval(()=>$('jam').textContent=jam(Date.now()),1000);
+
+// ---- Penyimpanan lokal (IndexedDB): data mahasiswa + antrean tap offline ----
+const db=new Promise((ok,no)=>{const r=indexedDB.open('gerbang',1);r.onupgradeneeded=()=>r.result.createObjectStore('kv');r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)});
+const idb={get:k=>db.then(d=>new Promise(ok=>{const q=d.transaction('kv').objectStore('kv').get(k);q.onsuccess=()=>ok(q.result);q.onerror=()=>ok()})),
+ set:(k,v)=>db.then(d=>new Promise(ok=>{const t=d.transaction('kv','readwrite');t.objectStore('kv').put(v,k);t.oncomplete=ok;t.onerror=ok}))};
+let C=null,Q=[],PIN=localStorage.getItem('pin'),lastRef=0,syncing=false,busy=false,last="",lastT=0,tm;
+function mintaPin(){PIN=prompt('Masukkan PIN scanner (dari admin):')||'';localStorage.setItem('pin',PIN)}
+if(!PIN)mintaPin();$('pin').onclick=mintaPin;
+const simpan=()=>{idb.set('Q',Q);idb.set('C',C)};
+const rpc=(fn,a)=>Promise.race([sb.rpc(fn,a),new Promise((_,j)=>setTimeout(()=>j(new Error('timeout')),5000))]);
+
+// ---- Bunyi & tampilan ----
+let ac;function bip(f,d,n){try{ac=ac||new AudioContext();for(let i=0;i<(n||1);i++){const o=ac.createOscillator(),g=ac.createGain();o.connect(g);g.connect(ac.destination);o.frequency.value=f;g.gain.value=.2;o.start(ac.currentTime+i*.25);o.stop(ac.currentTime+i*.25+d)}}catch(e){}}
+function badge(){const on=navigator.onLine;$('sts').textContent=(on?'● ONLINE':'● OFFLINE')+(Q.length?' — '+Q.length+' antrean':'');$('sts').style.color=on?'#2fbf8f':'#ffb020'}
+function tampil(c,st,nm,ket,foto){const l=$('layar'),f=$('foto');l.className=c;$('st').textContent=st;$('nm').textContent=nm||"";$('ket').textContent=ket||"";
+ if(foto){f.src=foto;f.style.display='block'}else f.style.display='none';
+ clearTimeout(tm);tm=setTimeout(()=>{l.className='idle';$('st').textContent='SIAP — TAP KARTU';$('nm').textContent='';$('ket').textContent='';f.style.display='none'},c=='bad'?7000:3500)}
+function riwayat(t){const li=document.createElement('li');li.textContent=jam(Date.now())+' — '+t;$('rw').prepend(li);while($('rw').children.length>20)$('rw').lastChild.remove()}
+function hasil(d,off){
+  const o=off?' (offline)':'';
+  if(!d.ok){tampil('bad','KARTU TIDAK DIKENAL','',d.pesan);bip(200,.6,2);riwayat('Kartu tidak dikenal'+o);return}
+  const lbl=d.nama+' ('+d.nim+')';
+  if(d.arah=='keluar'){
+    if(d.pelanggaran){tampil('bad','PELANGGARAN JAM MALAM',d.nama,'NIM '+d.nim+' — keluar saat jam malam'+o,d.foto);bip(300,.25,4);riwayat('⚠ KELUAR JAM MALAM: '+lbl+o)}
+    else{tampil('keluar','KELUAR',d.nama,'NIM '+d.nim+o,d.foto);bip(600,.2);riwayat('Keluar: '+lbl+o)}
+  }else if(d.arah=='masuk'){
+    tampil('masuk','MASUK',d.nama,(d.pelanggaran?'Tercatat keluar saat jam malam':'NIM '+d.nim)+o,d.foto);bip(900,.15,2);riwayat('Masuk: '+lbl+o)
+  }else tampil('dup','TAP GANDA',d.nama,'Tunggu beberapa detik',d.foto);
+  badge();
+}
+
+// ---- Mode offline: keputusan keluar/masuk dibuat di perangkat, dikirim nanti ----
+function lokal(kode){
+  if(!C)return{ok:false,pesan:'Belum ada data. Sambungkan internet sekali.'};
+  const m=C.mhs[kode];if(!m)return{ok:false,pesan:'Kartu tidak dikenal atau sudah diganti'};
+  const now=Date.now(),j=new Date(now).toLocaleTimeString('en-GB',{timeZone:W,hourCycle:'h23'}),a=C.mulai,b=C.selesai;
+  const malam=a>b?(j>=a||j<b):(j>=a&&j<b),t=C.diluar[m.nim];
+  const r={ok:true,nama:m.nama,nim:m.nim,foto:m.foto};
+  if(t!==undefined){
+    if(now-t<10000)return Object.assign(r,{arah:'duplikat'});
+    delete C.diluar[m.nim];Q.push({kode,waktu:new Date(now).toISOString()});simpan();
+    return Object.assign(r,{arah:'masuk',pelanggaran:!!(C.pel&&C.pel[m.nim])});
+  }
+  C.diluar[m.nim]=now;C.pel=C.pel||{};C.pel[m.nim]=malam;Q.push({kode,waktu:new Date(now).toISOString()});simpan();
+  return Object.assign(r,{arah:'keluar',pelanggaran:malam});
+}
+
+async function proses(kode){
+  kode=kode.trim();if(!kode||busy)return;if(kode===last&&Date.now()-lastT<3000)return;
+  busy=true;last=kode;lastT=Date.now();
+  let r;
+  if(navigator.onLine&&!Q.length){try{r=await rpc('tap',{p_pin:PIN,p_kode:kode})}catch(e){r={error:{message:'timeout'}}}}
+  else r={error:{message:'offline'}};
+  busy=false;
+  if(r.error){
+    if((r.error.message||'').includes('PIN salah')){mintaPin();tampil('bad','PIN SALAH','','Tap kartu sekali lagi');return}
+    if(r.error.code){tampil('bad','GAGAL','',r.error.message);return}
+    hasil(lokal(kode),true);return;      // tidak ada koneksi → proses lokal
+  }
+  const d=r.data;hasil(d,false);
+  if(d&&d.ok&&C){if(d.arah=='keluar'){C.diluar[d.nim]=Date.now();(C.pel=C.pel||{})[d.nim]=!!d.pelanggaran}else if(d.arah=='masuk')delete C.diluar[d.nim];simpan()}
+}
+
+// ---- Sinkronisasi otomatis saat internet kembali ----
+async function sinkron(){
+  if(syncing||!navigator.onLine||!PIN)return;syncing=true;
+  try{
+    if(Q.length){const kirim=Q.slice(),r=await rpc('sinkron',{p_pin:PIN,p_events:kirim});
+      if(r.error){if((r.error.message||'').includes('PIN salah'))mintaPin();throw r.error}
+      Q=Q.slice(kirim.length);await idb.set('Q',Q)}
+    if(!Q.length&&(!C||Date.now()-lastRef>300000)){
+      const r=await rpc('daftar_scanner',{p_pin:PIN});
+      if(!r.error&&r.data){const d=r.data,m={},o={};d.mhs.forEach(x=>m[x.kode]=x);d.diluar.forEach(n=>o[n]=0);
+        C={mulai:d.mulai,selesai:d.selesai,mhs:m,diluar:o,pel:{}};lastRef=Date.now();await idb.set('C',C)}}
+  }catch(e){}
+  syncing=false;badge();
+}
+(async()=>{C=(await idb.get('C'))||null;Q=(await idb.get('Q'))||[];badge();sinkron()})();
+setInterval(sinkron,15000);addEventListener('online',sinkron);addEventListener('offline',badge);
+
+// ---- Input: scanner USB (keyboard + Enter) atau kamera ----
+const inp=$('in');inp.focus();document.addEventListener('click',e=>{if(e.target.tagName!=='BUTTON')inp.focus()});
+inp.addEventListener('keydown',e=>{if(e.key==='Enter'){proses(inp.value);inp.value=''}});
+let qr;$('kam').onclick=async()=>{try{qr=new Html5Qrcode('reader');await qr.start({facingMode:'environment'},{fps:10,qrbox:200},t=>proses(t));$('kam').remove()}catch(e){alert('Kamera tidak bisa diakses: '+e)}};
+</script></body></html>
